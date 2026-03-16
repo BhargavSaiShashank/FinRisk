@@ -12,4 +12,6 @@ imbalanced-learn
 scipy
 boruta
 optuna
+shap
+tqdm
 pyyaml

@@ -5,53 +5,57 @@ import os
 
 def download_data(tickers, start_date, end_date):
     """
-    Download historical daily data for given tickers.
+    Downloads historical OHLC data from Yahoo Finance.
+    Handles multiple tickers and returns a combined DataFrame.
     """
-    data = yf.download(tickers, start=start_date, end=end_date, interval="1d")
+    data = yf.download(tickers, start=start_date, end=end_date)
     return data
 
-def process_data(data):
+def process_data(raw_data):
     """
-    Extract closing prices and compute log returns for the primary asset.
+    Extracts 'Adj Close' and computes log returns.
     """
-    # yfinance multi-index handling
-    if 'Adj Close' in data.columns:
-        adj_close = data['Adj Close']
-    elif isinstance(data.columns, pd.MultiIndex) and 'Adj Close' in data.columns.get_level_values(0):
-        adj_close = data['Adj Close']
+    # yfinance MultiIndex columns: Level 0 = Price Type, Level 1 = Ticker
+    if 'Adj Close' in raw_data.columns.get_level_values(0):
+        adj_close = raw_data['Adj Close']
+    elif 'Close' in raw_data.columns.get_level_values(0):
+        # Fallback to 'Close' if 'Adj Close' is missing (e.g. for some indices)
+        adj_close = raw_data['Close']
     else:
-        # Fallback to Close if Adj Close is missing
-        adj_close = data['Close']
+        # Single ticker case
+        adj_close = raw_data[['Adj Close']] if 'Adj Close' in raw_data.columns else raw_data[['Close']]
     
-    # Fill missing values
-    adj_close = adj_close.ffill().dropna()
+    # Fill missing values (forward fill then backward fill)
+    adj_close = adj_close.ffill().bfill()
     
-    # Compute log returns
+    # Log Returns: log(Pt / Pt-1)
     log_returns = np.log(adj_close / adj_close.shift(1)).dropna()
     
     return adj_close, log_returns
 
 def save_processed_data(df, filename):
-    """
-    Save processed dataframe to data/processed directory.
-    """
-    os.makedirs('data/processed', exist_ok=True)
-    path = os.path.join('data/processed', filename)
-    df.to_csv(path)
-    print(f"Saved processed data to {path}")
+    folder = os.path.join("data", "processed")
+    os.makedirs(folder, exist_ok=True)
+    df.to_csv(os.path.join(folder, filename))
+    print(f"Saved processed data to {os.path.join(folder, filename)}")
 
 if __name__ == "__main__":
-    primary_asset = "^STOXX50E"
-    # Equity indices: CAC40 (^FCHI), DAX (^GDAXI), AEX (^AEX)
-    # ETF: FEZ
-    # Currencies: EURUSD (EURUSD=X), EURGBP (EURGBP=X)
+    # Primary assets for multi-asset reinforcement
+    indices = ["^STOXX50E", "^GSPC", "^IXIC", "^N225"]
+    
+    # Explanatory variables
     others = ["^FCHI", "^GDAXI", "^AEX", "FEZ", "EURUSD=X", "EURGBP=X"]
-    all_tickers = [primary_asset] + others
+    
+    # Macroeconomic variables
+    # VIX: ^VIX, US 10Y: ^TNX, Oil: CL=F, Gold: GC=F
+    macro = ["^VIX", "^TNX", "CL=F", "GC=F"]
+    
+    all_tickers = list(set(indices + others + macro))
     
     start = "2008-09-01"
     end = "2025-03-31"
     
-    print(f"Downloading data for {all_tickers}...")
+    print(f"Downloading data for {len(all_tickers)} tickers...")
     raw_data = download_data(all_tickers, start, end)
     
     adj_close, log_returns = process_data(raw_data)
