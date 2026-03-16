@@ -3,205 +3,167 @@ import pandas as pd
 import numpy as np
 import torch
 import warnings
+import scipy.stats as stats
 from tqdm import tqdm
 from sklearn.preprocessing import MinMaxScaler
 from src.data_loader import process_data
 from src.feature_engineering import create_feature_matrix
-from src.rolling_garch import rolling_garch_estimation, generate_rolling_vars
-from src.var_estimation import calculate_risk_labels, generate_all_risks
+from src.rolling_garch import rolling_garch_estimation
+from src.var_estimation import adjust_risk_by_regime # Import the new helper
+from src.regime_labeling import label_market_regimes, plot_regimes
 from src.ddqn_agent import DDQNAgent
-from src.backtesting_tests import kupiec_pof_test, christoffersen_ind_test, acerbi_szekely_test, basel_traffic_light, adjust_var_rl
-from src.interpretability import explain_ddqn
-import scipy.stats as stats
+from src.backtesting_tests import kupiec_pof_test, christoffersen_ind_test, acerbi_szekely_test, basel_traffic_light
+from src.interpretability import explain_ddqn_regime
 import matplotlib.pyplot as plt
-import seaborn as sns
 
 warnings.filterwarnings('ignore')
 
-def run_asset_pipeline(asset_name, log_returns, adj_close, macro_data):
+def create_sequences(data, labels, seq_len):
     """
-    Runs the full robust framework for a single asset.
-    Includes walk-forward validation and final reporting.
+    Creates [batch, seq_len, n_features] for LSTM input.
     """
-    print(f"\n{'='*20} Pipeline: {asset_name} {'='*20}")
+    X, y = [], []
+    for i in range(seq_len, len(data)):
+        X.append(data[i-seq_len:i])
+        y.append(labels[i-1]) # Target is regime at end of sequence
+    return np.array(X), np.array(y)
+
+def run_regime_pipeline(asset_name, log_returns, adj_close, macro_data):
+    print(f"\n{'='*20} Regime Pipeline: {asset_name} {'='*20}")
     os.makedirs(f'results/{asset_name}/plots', exist_ok=True)
     
     # 1. Feature Prep
     returns = log_returns[asset_name]
     feat_matrix = create_feature_matrix(log_returns, adj_close)
-    
-    # Add macro data to the feat matrix if not already there
-    # Ensure no overlap issues
     feat_matrix = feat_matrix.join(macro_data, how='inner', rsuffix='_macro').dropna()
     returns = returns.loc[feat_matrix.index]
     
-    # 2. Volatility Analysis (Rolling)
-    # We use a 250-day rolling window
-    print(f"[{asset_name}] Running Rolling GARCH Estimation...")
-    vol_garch = rolling_garch_estimation(returns, window=250, model_type='GARCH') 
-    vol_gjr = rolling_garch_estimation(returns, window=250, model_type='GJR-GARCH')
+    # 2. Regime Labeling
+    print(f"[{asset_name}] Labeling Market Regimes...")
+    vix = macro_data['^VIX'].reindex(returns.index).ffill().bfill() if '^VIX' in macro_data.columns else None
+    regime_labels = label_market_regimes(returns, vix=vix)
+    plot_regimes(returns, regime_labels, path=f'results/{asset_name}/plots/regime_timeline.png')
+
+    # 3. Volatility (Baseline Rolling GARCH)
+    print(f"[{asset_name}] Running Rolling GARCH for base VaR...")
+    vol_garch = rolling_garch_estimation(returns, window=250, model_type='GARCH')
     
-    # 3. VaR & ES Estimation
-    print(f"[{asset_name}] Generating VaR and ES estimates...")
-    risks_df = pd.DataFrame(index=returns.index)
-    
+    # Base VaR/ES
     q5 = stats.norm.ppf(0.05)
-    risks_df['VaR_GARCH_5%'] = - (vol_garch * stats.norm.ppf(0.05))
-    risks_df['ES_GARCH_5%'] = vol_garch * (stats.norm.pdf(stats.norm.ppf(0.05)) / 0.05)
+    var_base = - (vol_garch * q5)
+    es_base = vol_garch * (stats.norm.pdf(q5) / 0.05)
 
-    # 4. Walk-Forward Validation
-    # We'll simulate 2 chunks: 2008-2020 (train) -> 2021-2025 (test)
-    # In a full framework, this would be more granular.
-    print(f"[{asset_name}] Starting Walk-Forward Evaluation...")
-    
-    labels, _ = calculate_risk_labels(returns, risks_df['VaR_GARCH_5%'])
-    full_df = feat_matrix.join(labels.rename('target'), how='inner').dropna()
-    
-    split_date = '2022-01-01'
-    X = full_df.drop(columns=['target'])
-    y = full_df['target']
-    
-    X_train_raw = X[X.index < split_date]
-    y_train = y[y.index < split_date]
-    X_test_raw = X[X.index >= split_date]
-    y_test = y[y.index >= split_date]
-    
+    # 4. Sequential Preparation & Walk-Forward
+    seq_len = 30
     scaler = MinMaxScaler()
-    X_train = scaler.fit_transform(X_train_raw)
-    X_test = scaler.transform(X_test_raw)
+    X_scaled = scaler.fit_transform(feat_matrix)
     
-    # 5. RL Agent Training (Asymmetric Reward)
-    print(f"[{asset_name}] Training Robust RL Agent...")
-    agent = DDQNAgent(X_train.shape[1], 2)
+    # 5. Walk-Forward Loop
+    # We'll use 2 major windows for execution speed: 
+    # W1: 2008-2021 (Train) -> 2022-2023 (Test)
+    # W2: 2008-2022 (Train) -> 2024-2025 (Test)
+    test_starts = ['2022-01-01', '2024-01-01']
+    all_preds = []
     
-    batch_size = 64
-    episodes = 20 # Increased for stability
-    for e in range(episodes):
-        total_reward = 0
-        for i in range(len(X_train)-1):
-            s = X_train[i]
-            a = agent.act(s)
-            r = agent.calculate_reward(a, y_train.iloc[i])
-            ns = X_train[i+1]
-            agent.remember(s, a, r, ns, False)
-            total_reward += r
-            if i % 50 == 0: agent.replay(batch_size)
-        agent.update_target_model()
-        if (e+1) % 5 == 0:
-            print(f"Episode {e+1}/{episodes} | Total Reward: {total_reward:.2f} | Eps: {agent.epsilon:.3f}")
+    for start_date in test_starts:
+        print(f"[{asset_name}] Window starting {start_date}...")
+        train_mask = feat_matrix.index < start_date
+        test_mask = (feat_matrix.index >= start_date) & (feat_matrix.index < (pd.Timestamp(start_date) + pd.DateOffset(years=2)))
+        
+        if test_mask.sum() == 0: continue
+        
+        # Sequencify
+        X_train_seq, y_train_regime = create_sequences(X_scaled[train_mask], regime_labels[train_mask].values, seq_len)
+        X_test_seq, y_test_regime = create_sequences(X_scaled[feat_matrix.index < (pd.Timestamp(start_date) + pd.DateOffset(years=2))], 
+                                                   regime_labels[feat_matrix.index < (pd.Timestamp(start_date) + pd.DateOffset(years=2))].values, seq_len)
+        
+        # Align test sequences to the actual test window dates
+        test_start_idx = np.where(feat_matrix.index[seq_len:] >= start_date)[0][0]
+        X_test_window = X_test_seq[test_start_idx:]
+        
+        # Train Agent
+        agent = DDQNAgent(input_size=X_scaled.shape[1], action_size=4, seq_len=seq_len)
+        episodes = 10
+        for e in range(episodes):
+            for i in range(len(X_train_seq)-1):
+                s, a, r, ns = X_train_seq[i], agent.act(X_train_seq[i]), 0, X_train_seq[i+1]
+                r = agent.calculate_reward(a, y_train_regime[i])
+                agent.remember(s, a, r, ns, False)
+                if i % 100 == 0: agent.replay(batch_size=32)
+            agent.update_target_model()
+            
+        # Predict
+        agent.epsilon = 0
+        window_preds = [agent.act(X_test_window[i]) for i in range(len(X_test_window))]
+        window_idx = feat_matrix.index[seq_len:][test_start_idx : test_start_idx + len(window_preds)]
+        all_preds.append(pd.Series(window_preds, index=window_idx))
 
-    # 6. Final Evaluation
-    print(f"[{asset_name}] Executing Final Evaluation & Stress Tests...")
-    agent.epsilon = 0 # No exploration for testing
-    preds = [agent.act(X_test[i]) for i in range(len(X_test))]
-    preds_ser = pd.Series(preds, index=y_test.index)
+    # Combine Walk-Forward Predictions
+    preds_combined = pd.concat(all_preds).sort_index()
+    preds_combined = preds_combined[~preds_combined.index.duplicated()]
     
-    v_base = risks_df['VaR_GARCH_5%'].loc[y_test.index]
-    es_base = risks_df['ES_GARCH_5%'].loc[y_test.index]
+    # 6. Regime-Dependent Adjustments
+    valid_idx = preds_combined.index
+    returns_test = returns.loc[valid_idx]
+    var_raw = var_base.loc[valid_idx]
+    es_raw = es_base.loc[valid_idx]
     
-    # Apply RL adjustment to VaR and ES
-    v_rl = pd.Series([adjust_var_rl(v, p) for v, p in zip(v_base, preds)], index=y_test.index)
-    # Simple ES adjustment: scaling proportional to VaR
-    es_rl = es_base * (v_rl / v_base) 
+    var_regime = pd.Series([adjust_risk_by_regime(v, p) for v, p in zip(var_raw, preds_combined)], index=valid_idx)
+    es_regime = pd.Series([adjust_risk_by_regime(e, p) for e, p in zip(es_raw, preds_combined)], index=valid_idx)
 
-    # Backtesting
-    p_kupiec, _ = kupiec_pof_test(returns.loc[y_test.index], v_rl)
-    p_ind, _ = christoffersen_ind_test(returns.loc[y_test.index], v_rl)
-    basel_zone, n_viol = basel_traffic_light(returns.loc[y_test.index], v_rl)
+    # 7. Backtesting
+    p_kupiec, _ = kupiec_pof_test(returns_test, var_regime)
+    p_ind, _ = christoffersen_ind_test(returns_test, var_regime)
+    basel_zone, n_viol = basel_traffic_light(returns_test, var_regime)
+    z_as, p_as = acerbi_szekely_test(returns_test, var_regime, es_regime)
     
-    # Acerbi-Szekely for ES
-    z_as, p_as = acerbi_szekely_test(returns.loc[y_test.index], v_rl, es_rl)
-    
-    results = {
-        'Asset': asset_name,
-        'Violations': n_viol,
-        'Basel_Zone': basel_zone,
-        'Kupiec_p': p_kupiec,
-        'Indep_p': p_ind,
-        'AcerbiSzekely_Z': z_as,
-        'Expected_Shortfall_Mean': es_rl.mean()
-    }
-    
-    # 7. Model Interpretation
-    print(f"[{asset_name}] Generating SHAP Interpretations...")
-    explain_ddqn(agent, X_train, X_test[:50], list(X.columns), 
-                path=f'results/{asset_name}/plots/shap_summary.png')
-
-    # 8. Stress Testing
-    print(f"[{asset_name}] Running Stress Test Scenarios...")
-    stress_results = run_stress_tests(returns, v_rl, es_rl)
-    results['Stress_Test_Failures'] = stress_results['failures']
-
-    # Visualizations
-    plt.figure(figsize=(12, 6))
-    plt.plot(returns.loc[y_test.index], label='Returns', alpha=0.3, color='gray')
-    plt.plot(-v_base, label='GARCH VaR (5%)', linestyle='--', color='blue')
-    plt.plot(-v_rl, label='RL-Adjusted VaR (5%)', color='red')
-    plt.fill_between(y_test.index, -es_rl, -v_rl, color='red', alpha=0.1, label='RL ES Zone')
-    plt.title(f'Risk Estimates: {asset_name} (Test Set)')
+    # 8. Visualizations
+    plt.figure(figsize=(15, 6))
+    plt.plot(returns_test, label='Returns', alpha=0.3, color='gray')
+    plt.plot(-var_raw, label='Base GARCH VaR', linestyle='--', color='blue')
+    plt.plot(-var_regime, label='Regime-Aware VaR', color='red')
+    plt.title(f'Regime-Aware VaR: {asset_name}')
     plt.legend()
-    plt.savefig(f'results/{asset_name}/plots/var_es_comparison.png')
+    plt.savefig(f'results/{asset_name}/plots/regime_var_comparison.png')
     plt.close()
 
-    return results
+    # 9. Interpretability
+    # Explain the last window's model
+    explain_ddqn_regime(agent, X_train_seq, X_test_window[:10], list(feat_matrix.columns), 
+                       path=f'results/{asset_name}/plots/shap_regime.png')
 
-def run_stress_tests(returns, var_series, es_series):
-    """
-    Simulates shocks and evaluates model response.
-    """
-    # 1. 2008 Crisis Scenario
-    # 2. COVID Crash Scenario
-    # 3. Sudden 10% Market Drop
-    shocks = {
-        'Financial_Crisis_2008': returns.loc['2008-09-01':'2008-12-31'],
-        'COVID_Crash_2020': returns.loc['2020-03-01':'2020-05-31']
+    return {
+        'Asset': asset_name,
+        'Basel_Zone': basel_zone,
+        'Violations': n_viol,
+        'Kupiec_p': p_kupiec,
+        'Indep_p': p_ind,
+        'Regime_Accuracy': (preds_combined == regime_labels.loc[valid_idx]).mean()
     }
-    
-    failures = 0
-    for name, data in shocks.items():
-        if len(data) == 0: continue
-        v_stress = var_series.reindex(data.index).ffill().bfill()
-        violations = (data < -v_stress).sum()
-        if violations > len(data) * 0.1: # If > 10% violations, it's a 'failure' under stress
-            failures += 1
-            
-    # Synthetic shock
-    synthetic_drop = -0.10
-    if len(var_series) > 0:
-        last_var = var_series.iloc[-1]
-        if synthetic_drop < -last_var:
-            failures += 1
-            
-    return {'failures': failures}
 
 def main():
-    # 1. Load Processed Data
     print("Loading datasets...")
     adj_close = pd.read_csv("data/processed/adj_close.csv", index_col=0, parse_dates=True)
     log_returns = pd.read_csv("data/processed/log_returns.csv", index_col=0, parse_dates=True)
     
-    # 2. Extract Macro Data
     macro_tickers = ["^VIX", "^TNX", "CL=F", "GC=F"]
     macro_data = log_returns[macro_tickers]
     
-    all_results = []
-    # Asset List
     target_assets = ["^STOXX50E", "^GSPC", "^IXIC", "^N225"]
+    all_results = []
     
     for asset in target_assets:
         try:
-            res = run_asset_pipeline(asset, log_returns, adj_close, macro_data)
+            res = run_regime_pipeline(asset, log_returns, adj_close, macro_data)
             all_results.append(res)
         except Exception as e:
-            print(f"Error processing {asset}: {e}")
+            print(f"Error in {asset}: {e}")
+            import traceback
+            traceback.print_exc()
             
-    # 3. Final Summary
     summary_df = pd.DataFrame(all_results)
-    os.makedirs('results', exist_ok=True)
-    summary_df.to_csv('results/robust_framework_comparison.csv', index=False)
-    print("\n" + "="*50)
-    print("ROBUST FRAMEWORK EVALUATION COMPLETE")
-    print("="*50)
+    summary_df.to_csv('results/regime_aware_comparison.csv', index=False)
+    print("\nREGIME-AWARE EVALUATION COMPLETE")
     print(summary_df)
 
 if __name__ == "__main__":

@@ -63,21 +63,18 @@ def generate_all_risks(returns, res_garch, res_gjr):
     
     return risks_df
 
-def calculate_risk_labels(returns, var_estimates):
+def adjust_risk_by_regime(base_value, regime_action):
     """
-    Labels: 1 if return <= c, else 0.
-    c = max{ r_k+1 | r_k+1 < -VaR_k+1 }
+    Multipliers:
+    0 (Calm) -> 1.0x
+    1 (Rising Vol) -> 1.3x
+    2 (Crash) -> 1.8x
+    3 (Recovery) -> 1.2x
     """
-    common_idx = returns.index.intersection(var_estimates.index)
-    r = returns.loc[common_idx]
-    v = var_estimates.loc[common_idx]
-    
-    violations = r[r < -v]
-    
-    if len(violations) > 0:
-        c = violations.max()
-    else:
-        c = -v.mean()
-        
-    labels = (r <= c).astype(int)
-    return labels, c
+    multipliers = {
+        0: 1.0,
+        1: 1.3,
+        2: 1.8,
+        3: 1.2
+    }
+    return base_value * multipliers.get(regime_action, 1.0)
