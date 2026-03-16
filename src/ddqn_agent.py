@@ -78,27 +78,21 @@ class DDQNAgent:
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
 
-    def calculate_reward(self, action, true_label):
+    def calculate_reward(self, current_violation_rate, target_rate=0.05):
         """
-        Regime Reward Logic:
-        - Correct Regime (Match): +5
-        - Early Crash Detect (Action=2, Label=2): +10
-        - Missed Crash (Action!=2, Label=2): -15
-        - False Crash Alarm (Action=2, Label!=2): -2
-        - Others: default
+        Statistically-Targeted Reward:
+        Optimizes for the target violation rate.
         """
-        if action == true_label:
-            reward = 5.0
-            if action == 2: reward += 5.0 # Extra bonus for getting crash right
-            return reward
+        # Base reward: negative absolute error from target
+        reward = -abs(current_violation_rate - target_rate) * 10.0 # Scale for impact
+        
+        # Penalties for drifting too far
+        if current_violation_rate < 0.03:
+            reward -= 5.0 # Too conservative
+        elif current_violation_rate > 0.07:
+            reward -= 5.0 # Too risky
             
-        if true_label == 2 and action != 2:
-            return -15.0 # Heavy penalty for missing crash
-            
-        if action == 2 and true_label != 2:
-            return -2.0 # False alarm
-            
-        return -1.0 # Generic penalty for mismatch
+        return reward
 
     def save(self, path):
         import os

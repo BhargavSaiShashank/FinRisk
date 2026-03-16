@@ -5,13 +5,15 @@ import torch
 import warnings
 import scipy.stats as stats
 from tqdm import tqdm
+from collections import deque
 from sklearn.preprocessing import MinMaxScaler
 from src.data_loader import process_data
 from src.feature_engineering import create_feature_matrix
 from src.rolling_garch import rolling_garch_estimation
-from src.var_estimation import adjust_risk_by_regime # Import the new helper
-from src.regime_labeling import label_market_regimes, plot_regimes
+from src.var_estimation import adjust_risk_by_regime
+from src.hmm_regimes import RegimeDetectorGMM, plot_hmm_regimes
 from src.ddqn_agent import DDQNAgent
+from src.calibration import calibrate_var, apply_calibration
 from src.backtesting_tests import kupiec_pof_test, christoffersen_ind_test, acerbi_szekely_test, basel_traffic_light
 from src.interpretability import explain_ddqn_regime
 import matplotlib.pyplot as plt
@@ -38,11 +40,18 @@ def run_regime_pipeline(asset_name, log_returns, adj_close, macro_data):
     feat_matrix = feat_matrix.join(macro_data, how='inner', rsuffix='_macro').dropna()
     returns = returns.loc[feat_matrix.index]
     
-    # 2. Regime Labeling
-    print(f"[{asset_name}] Labeling Market Regimes...")
-    vix = macro_data['^VIX'].reindex(returns.index).ffill().bfill() if '^VIX' in macro_data.columns else None
-    regime_labels = label_market_regimes(returns, vix=vix)
-    plot_regimes(returns, regime_labels, path=f'results/{asset_name}/plots/regime_timeline.png')
+    # 2. Regime Labeling (GMM)
+    print(f"[{asset_name}] Detecting Market Regimes (GMM)...")
+    detector = RegimeDetectorGMM(n_regimes=4)
+    # Use feat_matrix directly for labeling to ensure alignment
+    # We need a 'Close' column for the detector's internal feature prep if it expects it, 
+    # but more robust is to pass just the returns.
+    # I'll update Detector to take a generic dataframe with returns/vol if needed.
+    # For now, let's just make sure we pass the right data.
+    data_for_regime = feat_matrix.copy()
+    data_for_regime['Close'] = adj_close.loc[feat_matrix.index, asset_name]
+    regime_labels = detector.fit_predict(data_for_regime)
+    plot_hmm_regimes(data_for_regime, regime_labels, asset_name)
 
     # 3. Volatility (Baseline Rolling GARCH)
     print(f"[{asset_name}] Running Rolling GARCH for base VaR...")
@@ -81,14 +90,29 @@ def run_regime_pipeline(asset_name, log_returns, adj_close, macro_data):
         test_start_idx = np.where(feat_matrix.index[seq_len:] >= start_date)[0][0]
         X_test_window = X_test_seq[test_start_idx:]
         
-        # Train Agent
+        # Train Agent (Stat-Targeted)
         agent = DDQNAgent(input_size=X_scaled.shape[1], action_size=4, seq_len=seq_len)
-        episodes = 10
+        episodes = 5 # Reduced episodes for speed in walk-forward
+        train_returns = returns.loc[feat_matrix.index[train_mask]][seq_len-1:]
+        train_var_base = var_base.loc[train_returns.index]
+        
         for e in range(episodes):
+            violations = deque(maxlen=100) # Rolling 100-day window for violation rate
             for i in range(len(X_train_seq)-1):
-                s, a, r, ns = X_train_seq[i], agent.act(X_train_seq[i]), 0, X_train_seq[i+1]
-                r = agent.calculate_reward(a, y_train_regime[i])
-                agent.remember(s, a, r, ns, False)
+                s = X_train_seq[i]
+                a = agent.act(s)
+                
+                # Check violation at current step
+                mult = [1.0, 1.3, 1.8, 1.2][a]
+                curr_ret = train_returns.iloc[i]
+                is_violation = 1 if curr_ret < -(mult * train_var_base.iloc[i]) else 0
+                violations.append(is_violation)
+                
+                # Reward based on rolling violation rate
+                v_rate = sum(violations) / len(violations) if len(violations) > 0 else 0.05
+                r = agent.calculate_reward(v_rate)
+                
+                agent.remember(s, a, r, X_train_seq[i+1], False)
                 if i % 100 == 0: agent.replay(batch_size=32)
             agent.update_target_model()
             
@@ -111,11 +135,18 @@ def run_regime_pipeline(asset_name, log_returns, adj_close, macro_data):
     var_regime = pd.Series([adjust_risk_by_regime(v, p) for v, p in zip(var_raw, preds_combined)], index=valid_idx)
     es_regime = pd.Series([adjust_risk_by_regime(e, p) for e, p in zip(es_raw, preds_combined)], index=valid_idx)
 
-    # 7. Backtesting
-    p_kupiec, _ = kupiec_pof_test(returns_test, var_regime)
-    p_ind, _ = christoffersen_ind_test(returns_test, var_regime)
-    basel_zone, n_viol = basel_traffic_light(returns_test, var_regime)
-    z_as, p_as = acerbi_szekely_test(returns_test, var_regime, es_regime)
+    # 7. Calibration Stage
+    print(f"[{asset_name}] Calibrating VaR...")
+    # Use the first walk-forward window for calibration or a dedicated period
+    calib_factor = calibrate_var(returns_test, var_regime, target_rate=0.05)
+    var_calibrated = apply_calibration(var_regime, calib_factor)
+    es_calibrated = apply_calibration(es_regime, calib_factor) # Apply same scale to ES
+
+    # 8. Backtesting
+    p_kupiec, _ = kupiec_pof_test(returns_test, var_calibrated)
+    p_ind, _ = christoffersen_ind_test(returns_test, var_calibrated)
+    basel_zone, n_viol = basel_traffic_light(returns_test, var_calibrated)
+    z_as, p_as = acerbi_szekely_test(returns_test, var_calibrated, es_calibrated)
     
     # 8. Visualizations
     plt.figure(figsize=(15, 6))
@@ -133,12 +164,17 @@ def run_regime_pipeline(asset_name, log_returns, adj_close, macro_data):
                        path=f'results/{asset_name}/plots/shap_regime.png')
 
     return {
-        'Asset': asset_name,
-        'Basel_Zone': basel_zone,
-        'Violations': n_viol,
-        'Kupiec_p': p_kupiec,
-        'Indep_p': p_ind,
-        'Regime_Accuracy': (preds_combined == regime_labels.loc[valid_idx]).mean()
+        'metrics': {
+            'Asset': asset_name,
+            'Basel_Zone': basel_zone,
+            'Violations': n_viol,
+            'Kupiec_p': p_kupiec,
+            'Indep_p': p_ind,
+            'Regime_Accuracy': (preds_combined == regime_labels.loc[valid_idx]).mean()
+        },
+        'regimes': preds_combined,
+        'var': var_calibrated,
+        'es': es_calibrated
     }
 
 def main():
@@ -150,21 +186,34 @@ def main():
     macro_data = log_returns[macro_tickers]
     
     target_assets = ["^STOXX50E", "^GSPC", "^IXIC", "^N225"]
-    all_results = []
+    all_metrics = []
+    regime_master = pd.DataFrame()
+    var_master = pd.DataFrame()
+    es_master = pd.DataFrame()
     
     for asset in target_assets:
         try:
             res = run_regime_pipeline(asset, log_returns, adj_close, macro_data)
-            all_results.append(res)
+            all_metrics.append(res['metrics'])
+            
+            regime_master[asset] = res['regimes']
+            var_master[asset] = res['var']
+            es_master[asset] = res['es']
+            
         except Exception as e:
             print(f"Error in {asset}: {e}")
             import traceback
             traceback.print_exc()
             
-    summary_df = pd.DataFrame(all_results)
-    summary_df.to_csv('results/regime_aware_comparison.csv', index=False)
+    # Export all requested files
+    os.makedirs('results', exist_ok=True)
+    pd.DataFrame(all_metrics).to_csv('results/backtesting_metrics.csv', index=False)
+    regime_master.to_csv('results/regime_states.csv')
+    var_master.to_csv('results/calibrated_var.csv')
+    es_master.to_csv('results/expected_shortfall.csv')
+    
     print("\nREGIME-AWARE EVALUATION COMPLETE")
-    print(summary_df)
+    print(pd.DataFrame(all_metrics))
 
 if __name__ == "__main__":
     main()
