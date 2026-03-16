@@ -1,0 +1,15 @@
+numpy
+pandas
+yfinance
+arch
+scikit-learn
+joblib
+torch
+matplotlib
+seaborn
+statsmodels
+imbalanced-learn
+scipy
+boruta
+optuna
+pyyaml

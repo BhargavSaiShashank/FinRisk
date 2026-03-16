@@ -1,0 +1,3 @@
+Model,Kupiec P-Value,Violations
+Original GARCH,0.000687656470428677,24
+RL-Adjusted GARCH,0.0010043578851304247,67
